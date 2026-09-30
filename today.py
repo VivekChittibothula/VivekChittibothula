@@ -5,6 +5,7 @@ import os
 from lxml import etree
 import time
 import hashlib
+from urllib.parse import quote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Fine-grained personal access token with All Repositories access:
@@ -15,6 +16,7 @@ ACCESS_TOKEN = os.environ.get('ACCESS_TOKEN') or os.environ.get('GITHUB_TOKEN', 
 HEADERS = {'Authorization': f'Bearer {ACCESS_TOKEN}'} if ACCESS_TOKEN else {}
 USER_NAME = os.environ.get('USER_NAME') or os.environ.get('GITHUB_REPOSITORY_OWNER') or 'VivekChittibothula'
 TIME_ZONE = os.environ.get('TIME_ZONE', 'Asia/Kolkata')
+INACTIVE_DAYS = 30
 QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
 
 
@@ -326,7 +328,7 @@ def stars_counter(data):
     return total_stars
 
 
-def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib_data, follower_data, loc_data, greeting_data):
+def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib_data, follower_data, loc_data, greeting_data, activity_data):
     """
     Update the dynamic profile values in the SVG and save the file.
     """
@@ -334,6 +336,7 @@ def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib
     root = tree.getroot()
     values = {
         'greeting_data': greeting_data,
+        'activity_data': activity_data,
         'age_data': age_data,
         'commit_data': commit_data,
         'star_data': star_data,
@@ -509,6 +512,37 @@ def follower_getter(username):
     return int(request.json()['data']['user']['followers']['totalCount'])
 
 
+def activity_message(repository, now=None):
+    """Format recent activity, or show a message after a period of inactivity."""
+    if not repository or not repository.get('pushed_at'):
+        return "Sorry, I've been busy lately."
+    now = now or datetime.datetime.now(ZoneInfo(TIME_ZONE))
+    pushed_date = datetime.datetime.fromisoformat(
+        repository['pushed_at'].replace('Z', '+00:00')
+    ).astimezone(ZoneInfo(TIME_ZONE))
+    days_since_activity = (now.date() - pushed_date.date()).days
+    if days_since_activity > INACTIVE_DAYS:
+        return "Sorry, I've been busy lately."
+    return f"{repository.get('name', 'Unknown repository')} · {pushed_date.strftime('%d %b %Y')}"
+
+
+def recent_activity(username=None):
+    """Return the latest owned repository, or the inactive status message."""
+    username = username or USER_NAME
+    url = f'https://api.github.com/users/{quote(username, safe="")}/repos'
+    response = requests.get(
+        url,
+        params={'type': 'owner', 'sort': 'pushed', 'direction': 'desc', 'per_page': 1},
+        headers=HEADERS,
+        timeout=60,
+    )
+    if response.status_code != 200:
+        print(f'Warning: recent activity request failed with HTTP {response.status_code}')
+        return 'Activity unavailable'
+    repositories = response.json()
+    return activity_message(repositories[0] if repositories else None)
+
+
 def query_count(funct_id):
     """
     Counts how many times the GitHub GraphQL API is called
@@ -562,6 +596,8 @@ if __name__ == '__main__':
         ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER']
     )
     follower_data, follower_time = perf_counter(follower_getter, USER_NAME)
+    activity_data, activity_time = perf_counter(recent_activity)
+    formatter('recent activity', activity_time)
 
     # Cache and calculate commits + lines of code from repositories I can access.
     # A transient LOC/API failure should not prevent age and repository totals from updating.
@@ -597,7 +633,8 @@ if __name__ == '__main__':
         contrib_data,
         follower_data,
         total_loc[:-1],
-        greeting_data
+        greeting_data,
+        activity_data
     )
     svg_overwrite(
         'light_mode.svg',
@@ -608,10 +645,11 @@ if __name__ == '__main__':
         contrib_data,
         follower_data,
         total_loc[:-1],
-        greeting_data
+        greeting_data,
+        activity_data
     )
 
-    total_time = user_time + loc_time + commit_time + star_time + repo_time + contrib_time + follower_time
+    total_time = user_time + loc_time + commit_time + star_time + repo_time + contrib_time + follower_time + activity_time
     print('Total function time:', '{:.4f}'.format(total_time), 's')
     print('Total GitHub GraphQL API calls:', sum(QUERY_COUNT.values()))
     for funct_name, count in QUERY_COUNT.items():
