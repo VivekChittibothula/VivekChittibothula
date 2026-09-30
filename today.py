@@ -326,13 +326,14 @@ def stars_counter(data):
     return total_stars
 
 
-def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib_data, follower_data, loc_data):
+def svg_overwrite(filename, age_data, commit_data, star_data, repo_data, contrib_data, follower_data, loc_data, greeting_data):
     """
     Update the dynamic profile values in the SVG and save the file.
     """
     tree = etree.parse(filename)
     root = tree.getroot()
     values = {
+        'greeting_data': greeting_data,
         'age_data': age_data,
         'commit_data': commit_data,
         'star_data': star_data,
@@ -383,6 +384,22 @@ def profile_today():
         return datetime.datetime.now(ZoneInfo(TIME_ZONE)).date()
     except ZoneInfoNotFoundError as error:
         raise RuntimeError(f'TIME_ZONE is not a known IANA time zone: {TIME_ZONE}') from error
+
+
+def format_greeting(now=None):
+    """Return a time-zone-aware greeting for the profile card."""
+    if now is None:
+        try:
+            now = datetime.datetime.now(ZoneInfo(TIME_ZONE))
+        except ZoneInfoNotFoundError as error:
+            raise RuntimeError(f'TIME_ZONE is not a known IANA time zone: {TIME_ZONE}') from error
+    if now.hour < 12:
+        period = 'morning'
+    elif now.hour < 18:
+        period = 'afternoon'
+    else:
+        period = 'evening'
+    return f'Good {period}, visitor!'
 
 
 def calculate_age(birth_date, today=None):
@@ -528,6 +545,7 @@ if __name__ == '__main__':
     """
     print('Calculation times:')
 
+    greeting_data = format_greeting()
     age_data = format_age(calculate_age(birth_date_from_environment()))
 
     # Identify the account and calculate live GitHub statistics.
@@ -578,7 +596,8 @@ if __name__ == '__main__':
         repo_data,
         contrib_data,
         follower_data,
-        total_loc[:-1]
+        total_loc[:-1],
+        greeting_data
     )
     svg_overwrite(
         'light_mode.svg',
@@ -588,7 +607,8 @@ if __name__ == '__main__':
         repo_data,
         contrib_data,
         follower_data,
-        total_loc[:-1]
+        total_loc[:-1],
+        greeting_data
     )
 
     total_time = user_time + loc_time + commit_time + star_time + repo_time + contrib_time + follower_time

@@ -32,4 +32,4 @@ After pushing the repository:
 4. Check that `light_mode.svg` and `dark_mode.svg` were updated.
 5. Visit the profile and switch GitHub between light/dark mode.
 
-The scheduled run keeps the displayed stats current. The age is calculated using India time (`Asia/Kolkata`), so it changes after midnight in your time zone. If a GitHub API/LOC request has a temporary failure, the age and repository totals are still written and the previous LOC totals are retained.
+The scheduled runs keep the displayed stats and time-based greeting current. They run at 08:30, 14:30, and 20:30 India time. The age is calculated using India time (`Asia/Kolkata`), so it changes after midnight in your time zone. If a GitHub API/LOC request has a temporary failure, the age and repository totals are still written and the previous LOC totals are retained.
