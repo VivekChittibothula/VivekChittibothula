@@ -1,5 +1,9 @@
 name: README build
 
+concurrency:
+  group: profile-statistics
+  cancel-in-progress: false
+
 on:
   push:
     branches:
@@ -33,9 +37,10 @@ jobs:
 
       - name: Update README statistics
         env:
-          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          USER_NAME: ${{ secrets.USER_NAME }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN || github.token }}
+          USER_NAME: ${{ secrets.USER_NAME || github.repository_owner }}
           BIRTH_DATE: ${{ secrets.BIRTH_DATE }}
+          TIME_ZONE: Asia/Kolkata
         run: python today.py
 
       - name: Commit updated SVGs

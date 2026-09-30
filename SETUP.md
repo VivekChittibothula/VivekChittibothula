@@ -15,8 +15,10 @@ This is based on the automatic-statistics approach from Andrew Grant's profile r
 In **Settings → Secrets and variables → Actions**, add:
 
 - `USER_NAME` = `VivekChittibothula`
-- `ACCESS_TOKEN` = a fine-grained GitHub token with the read permissions needed by `today.py`.
+- `ACCESS_TOKEN` = optional for public statistics; add a fine-grained GitHub token with the read permissions needed by `today.py` if you want private repositories included. The workflow falls back to its built-in token for public data.
 - `BIRTH_DATE` = your birth date in `YYYY-MM-DD` format. This remains a secret; only your calculated age in years, months, and days is written to the SVG.
+
+`BIRTH_DATE` is required: if it is missing or invalid, the updater stops before writing either SVG, so the repository stats will appear frozen too.
 
 The workflow also needs permission to write repository contents, which is configured in the workflow.
 
@@ -30,4 +32,4 @@ After pushing the repository:
 4. Check that `light_mode.svg` and `dark_mode.svg` were updated.
 5. Visit the profile and switch GitHub between light/dark mode.
 
-The scheduled run keeps the displayed stats current.
+The scheduled run keeps the displayed stats current. The age is calculated using India time (`Asia/Kolkata`), so it changes after midnight in your time zone. If a GitHub API/LOC request has a temporary failure, the age and repository totals are still written and the previous LOC totals are retained.

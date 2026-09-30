@@ -5,13 +5,16 @@ import os
 from lxml import etree
 import time
 import hashlib
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Fine-grained personal access token with All Repositories access:
 # Account permissions: read:Followers, read:Starring, read:Watching
 # Repository permissions: read:Commit statuses, read:Contents, read:Issues, read:Metadata, read:Pull Requests
 # Issues and pull requests permissions not needed at the moment, but may be used in the future
-HEADERS = {'authorization': 'token ' + os.environ.get('ACCESS_TOKEN', '')}
-USER_NAME = os.environ.get('USER_NAME', 'VivekChittibothula')
+ACCESS_TOKEN = os.environ.get('ACCESS_TOKEN') or os.environ.get('GITHUB_TOKEN', '')
+HEADERS = {'Authorization': f'Bearer {ACCESS_TOKEN}'} if ACCESS_TOKEN else {}
+USER_NAME = os.environ.get('USER_NAME') or os.environ.get('GITHUB_REPOSITORY_OWNER') or 'VivekChittibothula'
+TIME_ZONE = os.environ.get('TIME_ZONE', 'Asia/Kolkata')
 QUERY_COUNT = {'user_getter': 0, 'follower_getter': 0, 'graph_repos_stars': 0, 'recursive_loc': 0, 'graph_commits': 0, 'loc_query': 0}
 
 
@@ -19,10 +22,29 @@ def simple_request(func_name, query, variables):
     """
     Returns a request, or raises an Exception if the response does not succeed.
     """
-    request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS)
-    if request.status_code == 200:
-        return request
-    raise Exception(func_name, ' has failed with a', request.status_code, request.text, QUERY_COUNT)
+    if not ACCESS_TOKEN:
+        raise RuntimeError(
+            'No GitHub token is configured. Add ACCESS_TOKEN as a repository secret '
+            'or run the workflow with its GITHUB_TOKEN.'
+        )
+    request = requests.post(
+        'https://api.github.com/graphql',
+        json={'query': query, 'variables': variables},
+        headers=HEADERS,
+        timeout=60,
+    )
+    try:
+        payload = request.json()
+    except ValueError:
+        payload = None
+    if request.status_code != 200:
+        raise RuntimeError(
+            f'{func_name} failed with HTTP {request.status_code}: {request.text}'
+        )
+    if payload and payload.get('errors'):
+        messages = '; '.join(error.get('message', str(error)) for error in payload['errors'])
+        raise RuntimeError(f'{func_name} failed in GitHub GraphQL: {messages}')
+    return request
 
 
 def graph_commits(start_date, end_date):
@@ -72,13 +94,20 @@ def graph_repos_stars(count_type, owner_affiliation, cursor=None, add_loc=0, del
             }
         }
     }'''
-    variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
-    request = simple_request(graph_repos_stars.__name__, query, variables)
-    if request.status_code == 200:
-        if count_type == 'repos':
-            return request.json()['data']['user']['repositories']['totalCount']
-        elif count_type == 'stars':
-            return stars_counter(request.json()['data']['user']['repositories']['edges'])
+    if count_type not in {'repos', 'stars'}:
+        raise ValueError(f'Unsupported repository count type: {count_type}')
+
+    total_stars = 0
+    total_repositories = 0
+    while True:
+        variables = {'owner_affiliation': owner_affiliation, 'login': USER_NAME, 'cursor': cursor}
+        request = simple_request(graph_repos_stars.__name__, query, variables)
+        repositories = request.json()['data']['user']['repositories']
+        total_repositories = repositories['totalCount']
+        total_stars += stars_counter(repositories['edges'])
+        if not repositories['pageInfo']['hasNextPage']:
+            return total_repositories if count_type == 'repos' else total_stars
+        cursor = repositories['pageInfo']['endCursor']
 
 
 def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, deletion_total=0, my_commits=0, cursor=None):
@@ -119,10 +148,20 @@ def recursive_loc(owner, repo_name, data, cache_comment, addition_total=0, delet
         }
     }'''
     variables = {'repo_name': repo_name, 'owner': owner, 'cursor': cursor}
-    request = requests.post('https://api.github.com/graphql', json={'query': query, 'variables':variables}, headers=HEADERS) # I cannot use simple_request(), because I want to save the file before raising Exception
+    request = requests.post(
+        'https://api.github.com/graphql',
+        json={'query': query, 'variables': variables},
+        headers=HEADERS,
+        timeout=60,
+    ) # I cannot use simple_request(), because I want to save the file before raising Exception
     if request.status_code == 200:
-        if request.json()['data']['repository']['defaultBranchRef'] != None: # Only count commits if repo isn't empty
-            return loc_counter_one_repo(owner, repo_name, data, cache_comment, request.json()['data']['repository']['defaultBranchRef']['target']['history'], addition_total, deletion_total, my_commits)
+        payload = request.json()
+        if payload.get('errors'):
+            force_close_file(data, cache_comment)
+            messages = '; '.join(error.get('message', str(error)) for error in payload['errors'])
+            raise RuntimeError(f'recursive_loc failed in GitHub GraphQL: {messages}')
+        if payload['data']['repository']['defaultBranchRef'] != None: # Only count commits if repo isn't empty
+            return loc_counter_one_repo(owner, repo_name, data, cache_comment, payload['data']['repository']['defaultBranchRef']['target']['history'], addition_total, deletion_total, my_commits)
         else: return 0
     force_close_file(data, cache_comment) # saves what is currently in the file before this program crashes
     if request.status_code == 403:
@@ -167,7 +206,7 @@ def loc_query(owner_affiliation, comment_size=0, force_cache=False, cursor=None,
                         defaultBranchRef {
                             target {
                                 ... on Commit {
-                                    history {
+                                    history(first: 1) {
                                         totalCount
                                         }
                                     }
@@ -209,7 +248,16 @@ def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
         with open(filename, 'w') as f:
             f.writelines(data)
 
-    if len(data)-comment_size != len(edges) or force_cache: # If the number of repos has changed, or force_cache is True
+    expected_hashes = [
+        hashlib.sha256(edge['node']['nameWithOwner'].encode('utf-8')).hexdigest()
+        for edge in edges
+    ]
+    cached_entries = data[comment_size:]
+    cache_matches_repositories = (
+        len(cached_entries) == len(expected_hashes)
+        and all(entry.split()[:1] == [repo_hash] for entry, repo_hash in zip(cached_entries, expected_hashes))
+    )
+    if not cache_matches_repositories or force_cache: # If the repositories or their order changed, rebuild the cache
         cached = False
         flush_cache(edges, filename, comment_size)
         with open(filename, 'r') as f:
@@ -217,17 +265,21 @@ def cache_builder(edges, comment_size, force_cache, loc_add=0, loc_del=0):
 
     cache_comment = data[:comment_size] # save the comment block
     data = data[comment_size:] # remove those lines
-    for index in range(len(edges)):
+    for index, edge in enumerate(edges):
+        node = edge['node']
         repo_hash, commit_count, *__ = data[index].split()
-        if repo_hash == hashlib.sha256(edges[index]['node']['nameWithOwner'].encode('utf-8')).hexdigest():
-            try:
-                if int(commit_count) != edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']:
-                    # if commit count has changed, update loc for that repo
-                    owner, repo_name = edges[index]['node']['nameWithOwner'].split('/')
-                    loc = recursive_loc(owner, repo_name, data, cache_comment)
-                    data[index] = repo_hash + ' ' + str(edges[index]['node']['defaultBranchRef']['target']['history']['totalCount']) + ' ' + str(loc[2]) + ' ' + str(loc[0]) + ' ' + str(loc[1]) + '\n'
-            except TypeError: # If the repo is empty
+        history = None
+        if node.get('defaultBranchRef') and node['defaultBranchRef'].get('target'):
+            history = node['defaultBranchRef']['target'].get('history')
+        commit_total = history['totalCount'] if history else 0
+        if int(commit_count) != commit_total:
+            if history is None: # The repository is empty.
                 data[index] = repo_hash + ' 0 0 0 0\n'
+            else:
+                # If the commit count changed, update LOC for that repository.
+                owner, repo_name = node['nameWithOwner'].split('/')
+                loc = recursive_loc(owner, repo_name, data, cache_comment)
+                data[index] = repo_hash + ' ' + str(commit_total) + ' ' + str(loc[2]) + ' ' + str(loc[0]) + ' ' + str(loc[1]) + '\n'
     with open(filename, 'w') as f:
         f.writelines(cache_comment)
         f.writelines(data)
@@ -325,9 +377,17 @@ def birth_date_from_environment():
         raise RuntimeError('BIRTH_DATE must use YYYY-MM-DD format.') from error
 
 
+def profile_today():
+    """Return today's date in the profile owner's configured time zone."""
+    try:
+        return datetime.datetime.now(ZoneInfo(TIME_ZONE)).date()
+    except ZoneInfoNotFoundError as error:
+        raise RuntimeError(f'TIME_ZONE is not a known IANA time zone: {TIME_ZONE}') from error
+
+
 def calculate_age(birth_date, today=None):
     """Calculate calendar age as years, months, and days."""
-    today = today or datetime.date.today()
+    today = profile_today() if today is None else today
     if birth_date > today:
         raise ValueError('BIRTH_DATE cannot be in the future.')
     years = today.year - birth_date.year
@@ -378,6 +438,25 @@ def commit_counter(comment_size):
     for line in data:
         total_commits += int(line.split()[2])
     return total_commits
+
+
+def cached_loc_data(comment_size):
+    """Read the last known LOC totals when a live LOC refresh is unavailable."""
+    filename = 'cache/' + hashlib.sha256(USER_NAME.encode('utf-8')).hexdigest() + '.txt'
+    try:
+        with open(filename, 'r') as f:
+            data = f.readlines()[comment_size:]
+    except FileNotFoundError:
+        return [0, 0, 0, True]
+
+    loc_add = 0
+    loc_del = 0
+    for line in data:
+        fields = line.split()
+        if len(fields) >= 5:
+            loc_add += int(fields[3])
+            loc_del += int(fields[4])
+    return [loc_add, loc_del, loc_add - loc_del, True]
 
 
 def user_getter(username):
@@ -456,15 +535,7 @@ if __name__ == '__main__':
     OWNER_ID, acc_date = user_data
     formatter('account data', user_time)
 
-    # Cache and calculate commits + lines of code from repositories I can access.
-    total_loc, loc_time = perf_counter(
-        loc_query,
-        ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'],
-        7
-    )
-    formatter('LOC (cached)', loc_time) if total_loc[-1] else formatter('LOC (no cache)', loc_time)
-
-    commit_data, commit_time = perf_counter(commit_counter, 7)
+    # Fetch the small, important profile statistics before the more expensive LOC scan.
     star_data, star_time = perf_counter(graph_repos_stars, 'stars', ['OWNER'])
     repo_data, repo_time = perf_counter(graph_repos_stars, 'repos', ['OWNER'])
     contrib_data, contrib_time = perf_counter(
@@ -473,6 +544,27 @@ if __name__ == '__main__':
         ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER']
     )
     follower_data, follower_time = perf_counter(follower_getter, USER_NAME)
+
+    # Cache and calculate commits + lines of code from repositories I can access.
+    # A transient LOC/API failure should not prevent age and repository totals from updating.
+    loc_time = 0
+    commit_time = 0
+    try:
+        total_loc, loc_time = perf_counter(
+            loc_query,
+            ['OWNER', 'COLLABORATOR', 'ORGANIZATION_MEMBER'],
+            7
+        )
+        formatter('LOC (cached)', loc_time) if total_loc[-1] else formatter('LOC (no cache)', loc_time)
+        commit_data, commit_time = perf_counter(commit_counter, 7)
+    except Exception as error:
+        print(f'Warning: LOC/commit refresh skipped: {error}')
+        total_loc = cached_loc_data(7)
+        commit_data = 0
+        try:
+            commit_data, commit_time = perf_counter(commit_counter, 7)
+        except FileNotFoundError:
+            pass
 
     # Format added/deleted/total LOC for display.
     for index in range(len(total_loc) - 1):
